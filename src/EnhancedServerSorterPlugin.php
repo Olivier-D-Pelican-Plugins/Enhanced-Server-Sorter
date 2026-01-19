@@ -5,10 +5,14 @@ namespace Olivier\EnhancedServerSorter;
 use App\Contracts\Plugins\HasPluginSettings;
 use App\Enums\HeaderActionPosition;
 use App\Filament\App\Resources\Servers\Pages\ListServers;
+use App\Models\Egg;
 use App\Models\Server;
+use App\Models\User;
+use Exception;
 use Filament\Actions\Action;
 use Filament\Contracts\Plugin;
 use Filament\Forms\Components\Hidden;
+use Filament\Forms\Components\Placeholder;
 use Filament\Forms\Components\Repeater;
 use Filament\Forms\Components\Select;
 use Filament\Forms\Components\TextInput;
@@ -18,6 +22,7 @@ use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Schema;
 use Olivier\EnhancedServerSorter\Models\DefaultFolder;
 use Olivier\EnhancedServerSorter\Models\DefaultFolderServerAssignment;
+use Olivier\EnhancedServerSorter\Models\EggFolderAssignment;
 use Olivier\EnhancedServerSorter\Models\ServerFolder;
 use Olivier\EnhancedServerSorter\Models\ServerFolderAssignment;
 use Olivier\EnhancedServerSorter\Providers\EnhancedServerSorterServiceProvider;
@@ -65,15 +70,16 @@ class EnhancedServerSorterPlugin implements HasPluginSettings, Plugin
             ->modalCancelActionLabel(fn () => trans('Enhanced-Server-Sorter::messages.cancel'))
             ->visible(fn () => user() !== null)
             ->form(function () {
-                if (!Schema::hasTable('enhanced_server_folders')) {
+                if (self::checkEnhanced() == false) {
                     return [
-                        \Filament\Forms\Components\Placeholder::make('migration_required')
+                        Placeholder::make('migration_required')
                             ->label(fn () => trans('Enhanced-Server-Sorter::messages.migration_required'))
                             ->content(fn () => trans('Enhanced-Server-Sorter::messages.migration_required_message'))
                     ];
                 }
 
                 $servers = user()?->accessibleServers()?->pluck('name', 'id') ?? collect();
+                $eggs = Egg::query()->orderBy('name')->pluck('name', 'id')->all();
 
                 return [
                     Repeater::make('folders')
@@ -85,7 +91,8 @@ class EnhancedServerSorterPlugin implements HasPluginSettings, Plugin
                             TextInput::make('name')
                                 ->label(fn () => trans('Enhanced-Server-Sorter::messages.folder_name'))
                                 ->required()
-                                ->maxLength(255),
+                                ->maxLength(255)
+                                ->columnSpanFull(),
                             Select::make('server_ids')
                                 ->label(fn () => trans('Enhanced-Server-Sorter::messages.servers'))
                                 ->multiple()
@@ -98,7 +105,15 @@ class EnhancedServerSorterPlugin implements HasPluginSettings, Plugin
                                     ? trans('Enhanced-Server-Sorter::messages.folder_locked') 
                                     : null)
                                 ->disableOptionsWhenSelectedInSiblingRepeaterItems(),
+                            Select::make('egg_ids')
+                                ->label(fn () => trans('Enhanced-Server-Sorter::messages.egg'))
+                                ->helperText(fn () => trans('Enhanced-Server-Sorter::messages.egg_folder_assignments_help'))
+                                ->multiple()
+                                ->options($eggs)
+                                ->searchable()
+                                ->preload(),
                         ])
+                        ->columns(2)
                         ->collapsed()
                         ->reorderableWithButtons()
                         ->addActionLabel(fn () => trans('Enhanced-Server-Sorter::messages.add_folder')),
@@ -154,17 +169,23 @@ class EnhancedServerSorterPlugin implements HasPluginSettings, Plugin
     {
         $user = user();
 
-        if (!$user) {
-            return [];
-        }
-
-        if (!Schema::hasTable('enhanced_server_folders')) {
+        if (self::checkEnhanced() == false) {
             return [];
         }
 
         try {
             $this->syncDefaultFoldersForUser($user->id);
             $lockedFolderNames = $this->getLockedFolderNames();
+
+            $eggAssignments = [];
+            if (Schema::hasTable('enhanced_server_egg_folder_assignments')) {
+                $eggAssignments = EggFolderAssignment::query()
+                    ->where('user_id', $user->id)
+                    ->get()
+                    ->groupBy('folder_id')
+                    ->map(fn ($assignments) => $assignments->pluck('egg_id')->all())
+                    ->all();
+            }
 
             return ServerFolder::query()
                 ->with('assignments')
@@ -175,6 +196,7 @@ class EnhancedServerSorterPlugin implements HasPluginSettings, Plugin
                     'id' => $folder->id,
                     'name' => $folder->name,
                     'server_ids' => $folder->assignments->pluck('server_id')->all(),
+                    'egg_ids' => $eggAssignments[$folder->id] ?? [],
                     'is_locked' => in_array($folder->name, $lockedFolderNames),
                 ])
                 ->all();
@@ -185,7 +207,7 @@ class EnhancedServerSorterPlugin implements HasPluginSettings, Plugin
 
     private function persistFolders(Collection $folders, int $userId): void
     {
-        if (!Schema::hasTable('enhanced_server_folders')) {
+        if (self::checkEnhanced() == false) {
             return;
         }
 
@@ -240,6 +262,11 @@ class EnhancedServerSorterPlugin implements HasPluginSettings, Plugin
             }
 
             $this->syncAssignments($folder, $serverIds, $userId);
+            
+            if (Schema::hasTable('enhanced_server_egg_folder_assignments')) {
+                $eggIds = collect($folderData['egg_ids'] ?? [])->unique()->values()->all();
+                $this->syncEggAssignments($folder, $eggIds, $userId);
+            }
         }
 
         ServerFolder::query()
@@ -262,7 +289,7 @@ class EnhancedServerSorterPlugin implements HasPluginSettings, Plugin
     private function getLockedFolderNames(): array
     {
         try {
-            if (!Schema::hasTable('enhanced_server_default_folders')) {
+            if (self::checkEnhanced() == false) {
                 return [];
             }
 
@@ -277,9 +304,6 @@ class EnhancedServerSorterPlugin implements HasPluginSettings, Plugin
 
     private function syncAssignments(ServerFolder $folder, array $serverIds, int $userId): void
     {
-        if (!Schema::hasTable('enhanced_server_folder_server')) {
-            return;
-        }
 
         ServerFolderAssignment::query()
             ->where('folder_id', $folder->id)
@@ -304,6 +328,35 @@ class EnhancedServerSorterPlugin implements HasPluginSettings, Plugin
         }
 
         ServerFolderAssignment::query()->insert($rows);
+    }
+
+    private function syncEggAssignments(ServerFolder $folder, array $eggIds, int $userId): void
+    {
+        if (self::checkEnhanced() == false) {
+            return;
+        }
+
+        EggFolderAssignment::query()
+            ->where('folder_id', $folder->id)
+            ->where('user_id', $userId)
+            ->delete();
+
+        if (empty($eggIds)) {
+            return;
+        }
+
+        $rows = [];
+        foreach ($eggIds as $eggId) {
+            $rows[] = [
+                'egg_id' => $eggId,
+                'user_id' => $userId,
+                'folder_id' => $folder->id,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ];
+        }
+
+        EggFolderAssignment::query()->insert($rows);
     }
 
     public function getSettingsForm(): array
@@ -350,7 +403,7 @@ class EnhancedServerSorterPlugin implements HasPluginSettings, Plugin
     protected function loadDefaultFolders(): array
     {
         try {
-            if (!Schema::hasTable('enhanced_server_default_folders')) {
+            if (self::checkEnhanced() == false) {
                 return [];
             }
 
@@ -486,23 +539,25 @@ class EnhancedServerSorterPlugin implements HasPluginSettings, Plugin
     public function syncDefaultFoldersForAllUsers(): void
     {
         try {
-            if (!Schema::hasTable('enhanced_server_default_folders')) {
+            if (self::checkEnhanced() == false) {
                 return;
             }
 
-            $userModelClass = config('panel.auth.models.user', \App\Models\User::class);
+            $userModelClass = config('panel.auth.models.user', User::class);
+            if (!$userModelClass) {return;}
             
-            if (!class_exists($userModelClass)) {
-                return;
-            }
-
             $users = $userModelClass::query()->get();
 
             foreach ($users as $user) {
                 $this->syncDefaultFoldersForUser($user->id);
             }
-        } catch (\Exception $e) {
+        } catch (Exception $e) {
         }
     }
-
+    private function checkEnhanced(): bool{
+        if (!Schema::hasTable('enhanced_server_folder_server')) {
+            return false;
+        }
+        else {return true;}
+    }
 }
