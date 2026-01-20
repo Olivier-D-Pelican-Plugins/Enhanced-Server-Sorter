@@ -21,8 +21,8 @@ return new class extends Migration
         if (!Schema::hasTable('enhanced_server_default_folder_servers')) {
             Schema::create('enhanced_server_default_folder_servers', function (Blueprint $table) {
                 $table->id();
-                $table->unsignedBigInteger('default_folder_id'); 
-                $table->unsignedBigInteger('server_id'); 
+                $table->unsignedBigInteger('default_folder_id');
+                $table->unsignedInteger('server_id');
                 $table->integer('position')->default(0);
                 $table->timestamps();
 
